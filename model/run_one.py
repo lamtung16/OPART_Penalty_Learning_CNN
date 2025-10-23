@@ -24,7 +24,7 @@ dataset   = row['dataset']
 test_fold = row['test_fold']
 
 # Early stopping parameters
-patience = 20
+patience = 200
 max_epochs = 1000
 
 # try to use gpu if available
@@ -32,7 +32,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Hinged Square Loss
 class SquaredHingeLoss(nn.Module):
-    def __init__(self, margin=0):
+    def __init__(self, margin=1):
         super(SquaredHingeLoss, self).__init__()
         self.margin = margin
 
@@ -58,19 +58,19 @@ class DeepCNN(nn.Module):
                 kernel_size=kernel_size,
             ))
             conv_layers.append(nn.BatchNorm1d(n_filters))
-            conv_layers.append(nn.ReLU())
+            conv_layers.append(nn.Tanh())
             in_channels = n_filters
         self.conv = nn.Sequential(*conv_layers)
 
-        # --- Global pooling ---
-        self.pool = nn.AdaptiveAvgPool1d(1)
+        # --- Global SUM pooling ---
+        self.pool = lambda x: torch.sum(x, dim=-1, keepdim=True)
 
         # --- MLP block ---
         mlp_layers = []
         in_features = n_filters
         for _ in range(n_dense_layers):
             mlp_layers.append(nn.Linear(in_features, n_neurons))
-            mlp_layers.append(nn.ReLU())
+            mlp_layers.append(nn.Tanh())
             in_features = n_neurons
 
         mlp_layers.append(nn.Linear(in_features, 1))
@@ -96,6 +96,7 @@ def test_model(model, inputs):
 
 # Function to compute loss value
 def get_loss_value(model, test_seqs, y_test, criterion):
+    model.eval()
     total_test_loss = 0
     with torch.no_grad():                                               # Disable gradient calculation
         for i, seq_input in enumerate(test_seqs):

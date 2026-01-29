@@ -8,6 +8,7 @@ import sys
 import lzma
 from sklearn.model_selection import KFold
 import copy
+import time
 
 # Set random seed for reproducibility
 random_seed = 123
@@ -17,11 +18,17 @@ np.random.seed(random_seed)
 random.seed(random_seed)
 
 # Load parameters
-params_df = pd.read_csv("params.csv")
+params_df = pd.read_csv("params_model.csv")
 param_row = int(sys.argv[1])
 row = params_df.iloc[param_row]
+
 dataset   = row['dataset']
 test_fold = row['test_fold']
+n_conv_layers = row['n_conv_layers']
+n_filters = row['n_filters']
+kernel_size = row['kernel_size']
+n_dense_layers = row['n_dense_layers']
+n_neurons = row['n_neurons']
 
 # Hyperparameters
 patience = 200
@@ -141,65 +148,62 @@ y_test  = torch.tensor(target_df_test.iloc[:, 1:].to_numpy(), dtype=torch.float3
 # Perform K-Fold Cross Validation
 kf = KFold(n_splits=n_cv, shuffle=True, random_state=random_seed)
 best_models = []
-
+total_training_time = 0.0
+total_best_val_loss = 0.0
 for train_idx, val_idx in kf.split(train_seqs):
+    model = DeepCNN(n_conv_layers, n_filters, kernel_size, n_dense_layers, n_neurons).to(device)
+    optimizer = torch.optim.Adam(model.parameters())
+    criterion = SquaredHingeLoss()
+
     best_model = None
-    best_val_loss = float('inf')
+    patience_counter = 0
+    best_model_state = None
+    best_val_loss_model = float('inf')
 
-    for n_conv_layers in [2, 4, 8]:
-        for n_filters in [2, 4, 8]:
-            for kernel_size in [2, 4, 8]:
-                for n_dense_layers in [1, 2]:
-                    for n_neurons in [10, 20, 50]:
-                        model = DeepCNN(n_conv_layers, n_filters, kernel_size, n_dense_layers, n_neurons).to(device)
-                        optimizer = torch.optim.Adam(model.parameters())
-                        criterion = SquaredHingeLoss()
-                        patience_counter = 0
-                        best_model_state = None
-                        best_val_loss_model = float('inf')
+    # --- Training loop ---
+    fold_start_time = time.time()
+    for epoch in range(max_epochs):
+        model.train()
+        total_train_loss = 0.0
 
-                        # --- Training loop ---
-                        for epoch in range(max_epochs):
-                            model.train()
-                            total_train_loss = 0.0
+        for i in train_idx:
+            seq_input = train_seqs[i].unsqueeze(0).unsqueeze(0).to(device)
+            target = y_train[i].unsqueeze(0).to(device)
+            
+            optimizer.zero_grad()
+            output = model(seq_input)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
 
-                            for i in train_idx:
-                                seq_input = train_seqs[i].unsqueeze(0).unsqueeze(0).to(device)
-                                target = y_train[i].unsqueeze(0).to(device)
-                                
-                                optimizer.zero_grad()
-                                output = model(seq_input)
-                                loss = criterion(output, target)
-                                loss.backward()
-                                optimizer.step()
+            total_train_loss += loss.item()
 
-                                total_train_loss += loss.item()
+        avg_train_loss = total_train_loss / len(train_idx)
 
-                            avg_train_loss = total_train_loss / len(train_idx)
+        # --- Validation ---
+        val_loss = get_loss_value(model, [train_seqs[i] for i in val_idx], y_train[val_idx], criterion)
 
-                            # --- Validation ---
-                            val_loss = get_loss_value(model, [train_seqs[i] for i in val_idx], y_train[val_idx], criterion)
+        # --- Early Stopping ---
+        if val_loss < best_val_loss_model:
+            best_val_loss_model = val_loss
+            best_model_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
-                            # --- Early Stopping ---
-                            if val_loss < best_val_loss_model:
-                                best_val_loss_model = val_loss
-                                best_model_state = copy.deepcopy(model.state_dict())
-                                patience_counter = 0
-                            else:
-                                patience_counter += 1
+        if patience_counter >= patience:
+            break
+    
+    # --- Fold timing ---
+    fold_time = time.time() - fold_start_time
+    total_training_time += fold_time
+    total_best_val_loss += best_val_loss_model
 
-                            if patience_counter >= patience:
-                                break
+    # --- Save best model per config ---
+    if best_model_state:
+        model.load_state_dict(best_model_state)
 
-                        # --- Save best model per config ---
-                        if best_model_state:
-                            model.load_state_dict(best_model_state)
-
-                        if best_val_loss_model < best_val_loss:
-                            best_val_loss = best_val_loss_model
-                            best_model = copy.deepcopy(model)
-
-    best_models.append(best_model)
+    best_models.append(copy.deepcopy(model))
 
 # --- Test Predictions ---
 model_outputs = []
@@ -218,4 +222,25 @@ prediction = pd.DataFrame({
 
 # Save to CSV
 os.makedirs("predictions", exist_ok=True)
-prediction.to_csv(f"predictions/{dataset}.{test_fold}.csv", index=False)
+prediction.to_csv(f"predictions/{dataset}.{test_fold}.{n_conv_layers}.{n_filters}.{kernel_size}.{n_dense_layers}.{n_neurons}.csv", index=False)
+
+os.makedirs("evaluations", exist_ok=True)
+evaluation = pd.DataFrame([{
+    "dataset": dataset,
+    "test_fold": test_fold,
+    "n_conv_layers": n_conv_layers,
+    "n_filters": n_filters,
+    "kernel_size": kernel_size,
+    "n_dense_layers": n_dense_layers,
+    "n_neurons": n_neurons,
+    "n_cv": n_cv,
+    "total_training_time_sec": total_training_time,
+    "total_best_val_loss_cv": total_best_val_loss,
+    "mean_best_val_loss_cv": total_best_val_loss / n_cv
+}])
+
+evaluation.to_csv(
+    f"evaluations/{dataset}.{test_fold}.{n_conv_layers}.{n_filters}."
+    f"{kernel_size}.{n_dense_layers}.{n_neurons}.csv",
+    index=False
+)
